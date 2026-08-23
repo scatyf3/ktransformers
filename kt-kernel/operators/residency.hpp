@@ -32,10 +32,14 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -62,8 +66,10 @@ struct BlobLayout {
 // Records are padded so every read is O_DIRECT-legal.
 class SsdExpertStore {
  public:
-  SsdExpertStore(const std::string& path, int expert_num, BlobLayout layout)
-      : path_(path), expert_num_(expert_num), layout_(layout) {
+  // `record_count` spans every (layer, expert) pair, not just one layer: all layer
+  // operators share a single store so the transient slot pool is amortised across layers.
+  SsdExpertStore(const std::string& path, int record_count, BlobLayout layout)
+      : path_(path), expert_num_(record_count), layout_(layout) {
     fd_write_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd_write_ < 0) throw std::runtime_error("residency: cannot open " + path + ": " + strerror(errno));
     fd_read_ = ::open(path.c_str(), O_RDONLY | O_DIRECT);
@@ -90,8 +96,8 @@ class SsdExpertStore {
   const BlobLayout& layout() const { return layout_; }
 
   // Buffered write, used once at startup to spill packed weights.
-  void write_expert(int expert_idx, const void* gate, const void* up, const void* down) {
-    const off_t base = static_cast<off_t>(expert_idx) * layout_.stride();
+  void write_expert(int record_idx, const void* gate, const void* up, const void* down) {
+    const off_t base = static_cast<off_t>(record_idx) * layout_.stride();
     pwrite_all(gate, layout_.gate, base);
     pwrite_all(up, layout_.up, base + layout_.padded_gate());
     pwrite_all(down, layout_.down, base + layout_.padded_gate() + layout_.padded_up());
@@ -101,8 +107,8 @@ class SsdExpertStore {
 
   // Blocking read into caller-supplied 4096-aligned buffers. Reads the padded length so the
   // request stays O_DIRECT-legal; the destination buffers must be padded accordingly.
-  void read_expert(int expert_idx, void* gate, void* up, void* down) {
-    const off_t base = static_cast<off_t>(expert_idx) * layout_.stride();
+  void read_expert(int record_idx, void* gate, void* up, void* down) {
+    const off_t base = static_cast<off_t>(record_idx) * layout_.stride();
     pread_all(gate, layout_.padded_gate(), base);
     pread_all(up, layout_.padded_up(), base + layout_.padded_gate());
     pread_all(down, layout_.padded_down(), base + layout_.padded_gate() + layout_.padded_up());
@@ -189,6 +195,108 @@ struct NullResidency {
   static constexpr bool kEnabled = false;
   bool is_offloaded(int64_t) const { return false; }
   int slot_of(int64_t) const { return -1; }
+};
+
+// Store and slot pool shared by every layer operator in the process.
+//
+// Sharing is not an optimisation, it is required for the design to save anything: layers each
+// own their own operator instance, so a per-layer pool of N slots would cost num_layers * N
+// slots of DRAM and cancel out exactly what offloading freed. Layers execute sequentially
+// within a forward pass, so one pool suffices.
+struct SharedResidency {
+  std::unique_ptr<SsdExpertStore> store;
+  std::unique_ptr<SlotPool> pool;
+  int expert_num = 0;
+  std::atomic<uint64_t> fault_count{0};
+  std::atomic<uint64_t> fault_nanos{0};
+
+  static SharedResidency& instance() {
+    static SharedResidency s;
+    return s;
+  }
+
+  // Idempotent: the first layer to reach this wins, the rest observe the built state.
+  void init_once(const std::string& path, int num_layers, int expert_num_, BlobLayout layout,
+                 int slot_count) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (store) return;
+    expert_num = expert_num_;
+    store = std::make_unique<SsdExpertStore>(path, num_layers * expert_num_, layout);
+    pool = std::make_unique<SlotPool>(slot_count, layout);
+    fprintf(stderr,
+            "[residency] store=%s direct=%s records=%d (%d layers x %d experts) "
+            "file=%.1f GiB | slots=%d (%.0f MiB, shared across layers)\n",
+            path.c_str(), store->direct() ? "yes" : "NO", num_layers * expert_num_, num_layers,
+            expert_num_, store->file_bytes() / 1073741824.0, slot_count, pool->bytes() / 1048576.0);
+  }
+
+  bool ready() const { return store != nullptr; }
+  int record_of(int layer_idx, int64_t expert_id) const {
+    return layer_idx * expert_num + static_cast<int>(expert_id);
+  }
+
+ private:
+  std::mutex mu_;
+};
+
+// Per-layer view. Owns nothing but the offload mask; storage comes from SharedResidency.
+//
+// Stage 1 contract: `load_phase` must be called after the activated-expert list is built and
+// before the GEMM section. It assigns one slot per activated offloaded expert and repoints the
+// corresponding BufferB objects, after which weight pointers stay fixed for the whole GEMM
+// section. No eviction happens while compute is running, so no pinning is needed.
+class LayerResidency {
+ public:
+  LayerResidency(int layer_idx, int expert_num, const uint8_t* offload_mask)
+      : layer_idx_(layer_idx), expert_num_(expert_num) {
+    mask_.assign(expert_num, 0);
+    if (offload_mask) {
+      for (int i = 0; i < expert_num; i++) mask_[i] = offload_mask[i];
+    }
+  }
+
+  bool is_offloaded(int64_t e) const {
+    return e >= 0 && e < expert_num_ && mask_[static_cast<size_t>(e)];
+  }
+  int offloaded_count() const {
+    int n = 0;
+    for (auto v : mask_) n += v ? 1 : 0;
+    return n;
+  }
+
+  // BufferPtrs is any container of shared_ptr<BufferB> supporting operator[].
+  template <class BufferVec>
+  void load_phase(const int* activated_ids, int activated_count, BufferVec& gate_bb, BufferVec& up_bb,
+                  BufferVec& down_bb) {
+    auto& sh = SharedResidency::instance();
+    if (!sh.ready()) return;
+    int next_slot = 0;
+    for (int i = 0; i < activated_count; i++) {
+      const int64_t e = activated_ids[i];
+      if (!is_offloaded(e)) continue;
+      if (next_slot >= sh.pool->size()) {
+        throw std::runtime_error(
+            "residency: slot pool exhausted (" + std::to_string(sh.pool->size()) +
+            " slots); it must hold every offloaded expert activated in one layer. Raise "
+            "ssd_slot_count or lower the offload fraction.");
+      }
+      const auto& slot = sh.pool->at(next_slot++);
+      auto t0 = std::chrono::steady_clock::now();
+      sh.store->read_expert(sh.record_of(layer_idx_, e), slot.gate, slot.up, slot.down);
+      sh.fault_nanos.fetch_add(
+          (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+      sh.fault_count.fetch_add(1, std::memory_order_relaxed);
+      gate_bb[e]->set_data(slot.gate);
+      up_bb[e]->set_data(slot.up);
+      down_bb[e]->set_data(slot.down);
+    }
+  }
+
+ private:
+  int layer_idx_;
+  int expert_num_;
+  std::vector<uint8_t> mask_;
 };
 
 }  // namespace kt_residency
