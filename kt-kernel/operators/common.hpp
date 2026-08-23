@@ -15,7 +15,9 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <string>
 #include <type_traits>
+#include <vector>
 
 // #define FORWARD_TIME_PROFILE
 // #define FORWARD_TIME_REPORT
@@ -253,9 +255,20 @@ struct GeneralMOEConfig {
   }
 
   // Check if expert should be skipped (invalid, out of range, or on GPU)
+  //
+  // NOTE: SSD-offloaded experts are deliberately NOT skipped here. They still execute on the
+  // CPU exactly like DRAM-resident ones; the only difference is that their weights are faulted
+  // in by LayerResidency::load_phase() before the GEMM section runs. Keeping them out of this
+  // predicate leaves the hot path (called qlen*k times per layer) untouched.
   inline bool should_skip_expert(int64_t expert_id) const {
     return expert_id < 0 || expert_id >= expert_num || (gpu_experts_mask && gpu_experts_mask[expert_id]);
   }
+
+  // SSD expert residency (stage 1). Disabled when ssd_experts_mask is null.
+  uint8_t* ssd_experts_mask = nullptr;  // Bool mask: true = expert has no permanent DRAM buffer
+  std::string ssd_store_path;           // Backing file holding packed weights for all layers
+  int ssd_num_layers = 0;               // Needed to key records by (layer_idx, expert_id)
+  int ssd_slot_count = 0;               // Shared transient slots; must cover one layer's peak
 
   void* gate_proj = nullptr;
   void* up_proj = nullptr;

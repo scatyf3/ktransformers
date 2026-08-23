@@ -34,6 +34,7 @@
 #include "../moe-tp.hpp"
 #include "la/amx.hpp"
 #include "llama.cpp/ggml.h"
+#include "../residency.hpp"
 
 template <class T, class Derived>
 class AMX_MOE_BASE {
@@ -55,6 +56,10 @@ class AMX_MOE_BASE {
 
   std::vector<std::shared_ptr<typename T::BufferA>> gate_up_ba_;
   std::vector<std::shared_ptr<typename T::BufferB>> gate_bb_;
+  // Raw allocations behind the *_bb_ buffers, kept so spill_offloaded_experts() can release
+  // them. BufferB only stores a pointer, so it cannot hand ownership back.
+  std::vector<void*> gate_bb_raw_, up_bb_raw_, down_bb_raw_;
+  std::unique_ptr<kt_residency::LayerResidency> residency_;
   std::vector<std::shared_ptr<typename T::BufferC>> gate_bc_;
   std::vector<std::shared_ptr<typename T::BufferB>> up_bb_;
   std::vector<std::shared_ptr<typename T::BufferC>> up_bc_;
@@ -133,13 +138,16 @@ class AMX_MOE_BASE {
 
       void* gate_bb_ptr =
           std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      gate_bb_raw_.push_back(gate_bb_ptr);
       gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
 
       void* up_bb_ptr = std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      up_bb_raw_.push_back(up_bb_ptr);
       up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
 
       void* down_bb_ptr =
           std::aligned_alloc(64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
+      down_bb_raw_.push_back(down_bb_ptr);
       down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
     }
     // TODO: need update to all *.hpp
@@ -159,6 +167,45 @@ class AMX_MOE_BASE {
     mem_requests.append_pointer(&down_bc_pool_, down_bc_pool_bytes_);
 
     shared_mem_buffer_numa.alloc(tp_part_idx, this, mem_requests);
+  }
+
+  // Stage 1 SSD residency setup. Call exactly once, after load_weights() and before any
+  // forward(): writes each offloaded expert's already-packed weights to the shared backing
+  // store and releases their DRAM. Spilling the packed form (rather than the source tensor)
+  // means a fault is a plain read with no AMX repacking on the critical path.
+  void spill_offloaded_experts() {
+    if (!config_.ssd_experts_mask) return;
+
+    kt_residency::BlobLayout layout;
+    layout.gate = buffer_b_required_size(config_.intermediate_size, config_.hidden_size);
+    layout.up = layout.gate;
+    layout.down = buffer_b_required_size(config_.hidden_size, config_.intermediate_size);
+
+    auto& sh = kt_residency::SharedResidency::instance();
+    sh.init_once(config_.ssd_store_path, config_.ssd_num_layers, config_.expert_num, layout,
+                 config_.ssd_slot_count);
+    residency_ = std::make_unique<kt_residency::LayerResidency>(
+        config_.layer_idx, config_.expert_num, config_.ssd_experts_mask);
+
+    int spilled = 0;
+    for (int e = 0; e < config_.expert_num; e++) {
+      if (!residency_->is_offloaded(e)) continue;
+      sh.store->write_expert(sh.record_of(config_.layer_idx, e), gate_bb_raw_[e], up_bb_raw_[e],
+                             down_bb_raw_[e]);
+      std::free(gate_bb_raw_[e]);
+      std::free(up_bb_raw_[e]);
+      std::free(down_bb_raw_[e]);
+      gate_bb_raw_[e] = up_bb_raw_[e] = down_bb_raw_[e] = nullptr;
+      // Leave the BufferB objects dangling on purpose: load_phase() repoints them before any
+      // GEMM touches them, and should_skip_expert() is unchanged so nothing else reads them.
+      gate_bb_[e]->set_data(nullptr);
+      up_bb_[e]->set_data(nullptr);
+      down_bb_[e]->set_data(nullptr);
+      spilled++;
+    }
+    sh.store->fsync_all();
+    fprintf(stderr, "[residency] layer %d: spilled %d/%d experts (%.0f MiB freed)\n",
+            config_.layer_idx, spilled, config_.expert_num, spilled * layout.stride() / 1048576.0);
   }
 
   ~AMX_MOE_BASE() { shared_mem_buffer_numa.dealloc(tp_part_idx, this); }
@@ -224,6 +271,12 @@ class AMX_MOE_BASE {
         m_expert_id_map_[activated_expert] = i;
         activated_expert++;
       }
+    }
+
+    // Load phase: fault in every activated offloaded expert *before* the GEMM section, which
+    // is parallel across experts and must see fixed weight pointers.
+    if (residency_) {
+      residency_->load_phase(m_expert_id_map_.data(), activated_expert, gate_bb_, up_bb_, down_bb_);
     }
 
     size_t offset = 0;
@@ -471,6 +524,11 @@ class AMX_MOE_BASE {
       m_local_pos_[0][i] = 0;
       m_local_num_[expert_ids[i]] = qlen;
       activated_expert++;
+    }
+
+    // See forward_prefill: the fault is hoisted out of the parallel GEMM section.
+    if (residency_) {
+      residency_->load_phase(m_expert_id_map_.data(), activated_expert, gate_bb_, up_bb_, down_bb_);
     }
 
     size_t offset = 0;

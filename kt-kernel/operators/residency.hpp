@@ -41,6 +41,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <type_traits>
 #include <string>
 #include <vector>
 
@@ -191,6 +192,13 @@ class SlotPool {
 
 // Zero-cost default. Every member is trivially inlined away, so an operator instantiated with
 // this policy compiles to exactly what it compiled to before residency existed.
+// Detects BufferB::set_data(void*). See LayerResidency::load_phase for why it is needed.
+template <class B, class = void>
+struct has_set_data : std::false_type {};
+template <class B>
+struct has_set_data<B, std::void_t<decltype(std::declval<B&>().set_data(std::declval<void*>()))>>
+    : std::true_type {};
+
 struct NullResidency {
   static constexpr bool kEnabled = false;
   bool is_offloaded(int64_t) const { return false; }
@@ -264,10 +272,22 @@ class LayerResidency {
     return n;
   }
 
-  // BufferPtrs is any container of shared_ptr<BufferB> supporting operator[].
+  // BufferVec is any container of shared_ptr<BufferB> supporting operator[].
+  //
+  // Only backends whose BufferB exposes set_data() can be retargeted at a slot. That is
+  // currently BF16 alone: the quantized BufferB variants (Int4/Int8/KGroup/MXFP4/...) keep
+  // weights, scales and zero points in separate allocations, so a single pointer swap cannot
+  // describe their residency anyway. For those the call compiles to a runtime error rather
+  // than a build failure, so the rest of the operator tree still builds unchanged.
   template <class BufferVec>
   void load_phase(const int* activated_ids, int activated_count, BufferVec& gate_bb, BufferVec& up_bb,
                   BufferVec& down_bb) {
+    using BufferB = typename BufferVec::value_type::element_type;
+    if constexpr (!has_set_data<BufferB>::value) {
+      (void)activated_ids; (void)activated_count; (void)gate_bb; (void)up_bb; (void)down_bb;
+      throw std::runtime_error(
+          "residency: this backend's BufferB has no set_data(); stage 1 supports --kt-method BF16 only");
+    } else {
     auto& sh = SharedResidency::instance();
     if (!sh.ready()) return;
     int next_slot = 0;
@@ -291,6 +311,7 @@ class LayerResidency {
       up_bb[e]->set_data(slot.up);
       down_bb[e]->set_data(slot.down);
     }
+    }  // if constexpr has_set_data
   }
 
  private:
