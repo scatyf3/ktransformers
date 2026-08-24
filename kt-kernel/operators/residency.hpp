@@ -51,7 +51,14 @@ constexpr size_t kIOAlign = 4096;  // O_DIRECT alignment for buffer, offset and 
 
 inline size_t align_up(size_t v, size_t a) { return (v + a - 1) / a * a; }
 
-// Byte sizes of one expert's three packed weight matrices, as produced by BufferB.
+/*
+Byte sizes of one expert's three weight matrices in a single layer.
+┌──────────── record 0 (layer0, expert0) ────────────┐
+│  gate 3 MiB  │   up 3 MiB   │  down 3 MiB          │   ← AMX tile for GEMM
+├──────────── record 1 (layer0, expert1) ────────────┤
+│                    ...                              │
+└─────────── record 6143 (layer47, expert127) ───────┘
+*/
 struct BlobLayout {
   size_t gate = 0;
   size_t up = 0;
@@ -63,20 +70,16 @@ struct BlobLayout {
   size_t stride() const { return padded_gate() + padded_up() + padded_down(); }
 };
 
-// Backing file holding already-packed expert weights, one fixed-size record per expert.
-// Records are padded so every read is O_DIRECT-legal.
 class SsdExpertStore {
  public:
-  // `record_count` spans every (layer, expert) pair, not just one layer: all layer
-  // operators share a single store so the transient slot pool is amortised across layers.
+
+  // init 2 fd handle for read and write using give path and save the layout
   SsdExpertStore(const std::string& path, int record_count, BlobLayout layout)
       : path_(path), expert_num_(record_count), layout_(layout) {
     fd_write_ = ::open(path.c_str(), O_RDWR | O_CREAT, 0644);
     if (fd_write_ < 0) throw std::runtime_error("residency: cannot open " + path + ": " + strerror(errno));
     fd_read_ = ::open(path.c_str(), O_RDONLY | O_DIRECT);
     if (fd_read_ < 0) {
-      // Not fatal: some filesystems reject O_DIRECT. Fall back, but say so loudly since it
-      // silently turns every measurement into a page-cache measurement.
       fd_read_ = ::open(path.c_str(), O_RDONLY);
       direct_ = false;
       fprintf(stderr, "[residency] WARNING: O_DIRECT unavailable on %s, reads go through page cache\n",
@@ -118,11 +121,16 @@ class SsdExpertStore {
   size_t file_bytes() const { return static_cast<size_t>(expert_num_) * layout_.stride(); }
 
  private:
+  // naive read
   void pwrite_all(const void* buf, size_t len, off_t off) {
     const char* p = static_cast<const char*>(buf);
     while (len > 0) {
       ssize_t n = ::pwrite(fd_write_, p, len, off);
-      if (n <= 0) throw std::runtime_error(std::string("residency: pwrite failed: ") + strerror(errno));
+      if (n < 0) {
+        if (errno == EINTR) continue;  // signal mid-transfer: retry, do not fail
+        throw std::runtime_error(std::string("residency: pwrite failed: ") + strerror(errno));
+      }
+      if (n == 0) throw std::runtime_error("residency: pwrite made no progress");
       p += n;
       off += n;
       len -= static_cast<size_t>(n);
@@ -133,8 +141,11 @@ class SsdExpertStore {
     char* p = static_cast<char*>(buf);
     while (len > 0) {
       ssize_t n = ::pread(fd_read_, p, len, off);
-      if (n < 0) throw std::runtime_error(std::string("residency: pread failed: ") + strerror(errno));
-      if (n == 0) break;  // short read at EOF: trailing padding of the last record
+      if (n < 0) {
+        if (errno == EINTR) continue;  // signal mid-transfer: retry, do not fail
+        throw std::runtime_error(std::string("residency: pread failed: ") + strerror(errno));
+      }
+      if (n == 0) break;  // legitimate EOF: the last record's trailing padding was never written
       p += n;
       off += n;
       len -= static_cast<size_t>(n);
