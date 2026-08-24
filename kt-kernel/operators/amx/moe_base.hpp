@@ -176,6 +176,15 @@ class AMX_MOE_BASE {
   void spill_offloaded_experts() {
     if (!config_.ssd_experts_mask) return;
 
+    // Same restriction as load_phase(): a spilled expert is retargeted at a slot through
+    // BufferB::set_data(), which today only the BF16 buffer has. Guarding here rather than
+    // letting the call fail to compile keeps this function instantiable for every backend, so
+    // the Python binding can be declared once instead of per backend.
+    if constexpr (!kt_residency::has_set_data<typename T::BufferB>::value) {
+      throw std::runtime_error(
+          "residency: this backend's BufferB has no set_data(); stage 1 supports --kt-method BF16 only");
+    } else {
+
     kt_residency::BlobLayout layout;
     layout.gate = buffer_b_required_size(config_.intermediate_size, config_.hidden_size);
     layout.up = layout.gate;
@@ -206,6 +215,7 @@ class AMX_MOE_BASE {
     sh.store->fsync_all();
     fprintf(stderr, "[residency] layer %d: spilled %d/%d experts (%.0f MiB freed)\n",
             config_.layer_idx, spilled, config_.expert_num, spilled * layout.stride() / 1048576.0);
+    }  // if constexpr has_set_data
   }
 
   ~AMX_MOE_BASE() { shared_mem_buffer_numa.dealloc(tp_part_idx, this); }
