@@ -1,31 +1,10 @@
-// Copyright (c) MoEPrefetch.
-// SPDX-License-Identifier: Apache-2.0
-//
-// SSD expert residency, stage 1: synchronous load, no prefetch, no cross-layer cache.
-//
-// Motivation: kt currently requires every expert to fit in CPU DRAM. `gate_bb_`/`up_bb_`/
-// `down_bb_` are allocated per expert at construction and never change afterwards, so the
-// resident set is fixed at `expert_num`. This header adds a third tier: a subset of experts
-// keeps no permanent DRAM buffer and is faulted in from a backing file on demand.
-//
-// Key structural constraint that shapes this design: the GEMM section of a forward pass is
-// parallel *across experts* (`do_work_stealing_job(nth * activated_expert * 2, ...)`), so a
-// fault taken inside it would either need one scratch slot per concurrently-computed expert
-// (no memory saved) or a lock (parallelism destroyed). Instead the fault is hoisted into a
-// separate phase that runs *before* the GEMM section:
-//
-//     forward()
-//       |- determine activated experts
-//       |- [load phase]  ensure_resident(e) for each activated SSD expert -> BufferB::set_data
-//       `- [GEMM phase]  unchanged; weight pointers are already fixed
-//
-// Because slot assignment only happens in the load phase, weight buffers stay immutable for
-// the whole duration of the GEMM phase. The "weights never move after load" assumption that
-// the rest of the operator tree relies on is therefore preserved, and no pinning or
-// refcounting is required at this stage.
-//
-// Reads use O_DIRECT: on a machine with hundreds of GB of page cache, buffered reads would
-// report cache hits rather than device behaviour and make the measurement meaningless.
+// SSD expert residency, stage 1: synchronous load, no prefetch, no cross-layer cache.  The code contains
+// BlobLayout for expert weight layout
+// SsdExpertStore to hold handle for expert read and write, and perform expert read/write
+// SlotPool pre-allocated fixed DRAM slots
+// SharedResidency for SSD Expert state scedule
+// LayerResidency for layer wise expert state view, hold expert offload mask only. call load_phase to load per layer expert to slotpool
+// Corrness is check by expert weight bit exact with ktransformers' official loader
 
 #pragma once
 
@@ -53,6 +32,7 @@ inline size_t align_up(size_t v, size_t a) { return (v + a - 1) / a * a; }
 
 /*
 Byte sizes of one expert's three weight matrices in a single layer.
+Hardcoded qwen3 layout
 ┌──────────── record 0 (layer0, expert0) ────────────┐
 │  gate 3 MiB  │   up 3 MiB   │  down 3 MiB          │   ← AMX tile for GEMM
 ├──────────── record 1 (layer0, expert1) ────────────┤
@@ -99,7 +79,7 @@ class SsdExpertStore {
   bool direct() const { return direct_; }
   const BlobLayout& layout() const { return layout_; }
 
-  // Buffered write, used once at startup to spill packed weights.
+  // given the expert index, write the expert to gate/up/down buffer
   void write_expert(int record_idx, const void* gate, const void* up, const void* down) {
     const off_t base = static_cast<off_t>(record_idx) * layout_.stride();
     pwrite_all(gate, layout_.gate, base);
@@ -109,8 +89,7 @@ class SsdExpertStore {
 
   void fsync_all() { ::fsync(fd_write_); }
 
-  // Blocking read into caller-supplied 4096-aligned buffers. Reads the padded length so the
-  // request stays O_DIRECT-legal; the destination buffers must be padded accordingly.
+  // given the expert index, read the expert to gate/up/down buffer
   void read_expert(int record_idx, void* gate, void* up, void* down) {
     const off_t base = static_cast<off_t>(record_idx) * layout_.stride();
     pread_all(gate, layout_.padded_gate(), base);
@@ -121,7 +100,7 @@ class SsdExpertStore {
   size_t file_bytes() const { return static_cast<size_t>(expert_num_) * layout_.stride(); }
 
  private:
-  // naive read
+  // naive write to write len byte to offset off inside buffer
   void pwrite_all(const void* buf, size_t len, off_t off) {
     const char* p = static_cast<const char*>(buf);
     while (len > 0) {
@@ -136,7 +115,7 @@ class SsdExpertStore {
       len -= static_cast<size_t>(n);
     }
   }
-
+  // naive read to write read byte to offset off inside buffer
   void pread_all(void* buf, size_t len, off_t off) {
     char* p = static_cast<char*>(buf);
     while (len > 0) {
@@ -160,7 +139,8 @@ class SsdExpertStore {
   bool direct_ = true;
 };
 
-// Fixed pool of DRAM slots, each holding one expert's three packed matrices.
+// Fixed pool of DRAM slots, each holding one expert's three packed matrices. 
+// which is reserver for expert load from ssd in dram
 class SlotPool {
  public:
   SlotPool(int slot_count, BlobLayout layout) : layout_(layout) {
@@ -201,8 +181,6 @@ class SlotPool {
   std::vector<Slot> slots_;
 };
 
-// Zero-cost default. Every member is trivially inlined away, so an operator instantiated with
-// this policy compiles to exactly what it compiled to before residency existed.
 // Detects BufferB::set_data(void*). See LayerResidency::load_phase for why it is needed.
 template <class B, class = void>
 struct has_set_data : std::false_type {};
@@ -210,18 +188,13 @@ template <class B>
 struct has_set_data<B, std::void_t<decltype(std::declval<B&>().set_data(std::declval<void*>()))>>
     : std::true_type {};
 
-struct NullResidency {
-  static constexpr bool kEnabled = false;
-  bool is_offloaded(int64_t) const { return false; }
-  int slot_of(int64_t) const { return -1; }
-};
-
-// Store and slot pool shared by every layer operator in the process.
+// Process-wide owner of the backing store and slot pool.
 //
-// Sharing is not an optimisation, it is required for the design to save anything: layers each
-// own their own operator instance, so a per-layer pool of N slots would cost num_layers * N
-// slots of DRAM and cancel out exactly what offloading freed. Layers execute sequentially
-// within a forward pass, so one pool suffices.
+// Intended end state: each layer resolves its activated experts against this,
+// getting DRAM hits where possible and SSD loads otherwise. 
+// 
+// Today only the second half exists — there is no residency map and no hit path, so every
+// offloaded expert is re-read on every access (Stage 2 adds the cache).
 struct SharedResidency {
   std::unique_ptr<SsdExpertStore> store;
   std::unique_ptr<SlotPool> pool;
@@ -234,7 +207,6 @@ struct SharedResidency {
     return s;
   }
 
-  // Idempotent: the first layer to reach this wins, the rest observe the built state.
   void init_once(const std::string& path, int num_layers, int expert_num_, BlobLayout layout,
                  int slot_count) {
     std::lock_guard<std::mutex> lk(mu_);
@@ -259,11 +231,6 @@ struct SharedResidency {
 };
 
 // Per-layer view. Owns nothing but the offload mask; storage comes from SharedResidency.
-//
-// Stage 1 contract: `load_phase` must be called after the activated-expert list is built and
-// before the GEMM section. It assigns one slot per activated offloaded expert and repoints the
-// corresponding BufferB objects, after which weight pointers stay fixed for the whole GEMM
-// section. No eviction happens while compute is running, so no pinning is needed.
 class LayerResidency {
  public:
   LayerResidency(int layer_idx, int expert_num, const uint8_t* offload_mask)
@@ -283,13 +250,18 @@ class LayerResidency {
     return n;
   }
 
-  // BufferVec is any container of shared_ptr<BufferB> supporting operator[].
-  //
-  // Only backends whose BufferB exposes set_data() can be retargeted at a slot. That is
-  // currently BF16 alone: the quantized BufferB variants (Int4/Int8/KGroup/MXFP4/...) keep
-  // weights, scales and zero points in separate allocations, so a single pointer swap cannot
-  // describe their residency anyway. For those the call compiles to a runtime error rather
-  // than a build failure, so the rest of the operator tree still builds unchanged.
+  /*
+  
+  load expert to slot pool before GEMM, core code is shown below
+  for each activated expert e:
+    if (!is_offloaded(e)) continue;
+    slot = pool[next_slot++]           
+    store->read_expert(layer*E+e, slot) 
+    gate_bb[e]->set_data(slot.gate)
+    gate_bb[e]->set_data(slot.gate);
+    up_bb[e]->set_data(slot.up);
+    down_bb[e]->set_data(slot.down);
+  */
   template <class BufferVec>
   void load_phase(const int* activated_ids, int activated_count, BufferVec& gate_bb, BufferVec& up_bb,
                   BufferVec& down_bb) {
