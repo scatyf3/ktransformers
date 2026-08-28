@@ -28,6 +28,15 @@ concept MOE_TP_PART = requires(T t, int qlen, int k, const int64_t* expert_ids, 
   // { t.load_weights() } -> std::same_as<void>;
 };
 
+// Detects a TP part that implements the stage 1 SSD spill. Only the AMX backends carry one, so
+// binding spill_offloaded_experts() unconditionally would otherwise fail to compile for the
+// others; this turns it into a runtime error there instead, leaving the rest of the tree alone.
+template <class P, class = void>
+struct has_spill_offloaded_experts : std::false_type {};
+template <class P>
+struct has_spill_offloaded_experts<P, std::void_t<decltype(std::declval<P&>().spill_offloaded_experts())>>
+    : std::true_type {};
+
 template <MOE_TP_PART T, typename Concrete = T>
 class TP_MOE_Common : public MoE_Interface {
   static_assert(std::is_base_of_v<T, Concrete>);
@@ -168,6 +177,34 @@ class TP_MOE_Common : public MoE_Interface {
   }
 
   ~TP_MOE_Common() { shared_mem_buffer.dealloc(this); }
+
+  // Stage 1 SSD residency. Call exactly once, after load_weights() and before any forward():
+  // the offloaded experts' already-packed weights go to the shared backing store and their DRAM
+  // is released. A no-op when config.ssd_experts_mask is null, so callers can invoke it
+  // unconditionally.
+  void spill_offloaded_experts() {
+    if (config.ssd_experts_mask == nullptr) return;
+    if constexpr (!has_spill_offloaded_experts<T>::value) {
+      throw std::runtime_error(
+          "residency: this MoE backend has no spill_offloaded_experts(); stage 1 supports AMX BF16 only");
+    } else {
+      if (!weights_loaded) {
+        throw std::runtime_error("residency: spill_offloaded_experts() called before load_weights()");
+      }
+      // Records in the backing store are keyed by (layer_idx, expert_id) alone. Under TP each
+      // part holds a slice of intermediate_size, so every part of a layer would key to the same
+      // record and overwrite the others. Refuse rather than silently corrupt the store.
+      if (tp_count != 1) {
+        throw std::runtime_error(
+            "residency: stage 1 does not support TP splitting (" + std::to_string(tp_count) +
+            " parts); records are keyed by (layer, expert) only. Run with a single NUMA subpool.");
+      }
+      // Called on this thread rather than through do_numa_job: spill only writes to a file and
+      // frees, so it has no NUMA locality to preserve, and a direct call keeps the exception path
+      // simple.
+      tps[0]->spill_offloaded_experts();
+    }
+  }
 
   void warm_up() {
     int qlen = config.max_possible_qlen();

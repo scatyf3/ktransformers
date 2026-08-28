@@ -230,6 +230,35 @@ struct SharedResidency {
   std::mutex mu_;
 };
 
+// Aggregate fault counters, for reporting what a run actually paid to the device. Bytes are
+// derived from the record stride rather than counted separately: every fault reads exactly one
+// whole record.
+struct ResidencyStats {
+  uint64_t faults = 0;
+  uint64_t nanos = 0;
+  uint64_t bytes = 0;
+  int slot_count = 0;
+  bool enabled = false;
+};
+
+inline ResidencyStats residency_stats() {
+  auto& sh = SharedResidency::instance();
+  ResidencyStats out;
+  if (!sh.ready()) return out;
+  out.enabled = true;
+  out.faults = sh.fault_count.load(std::memory_order_relaxed);
+  out.nanos = sh.fault_nanos.load(std::memory_order_relaxed);
+  out.bytes = out.faults * sh.store->layout().stride();
+  out.slot_count = sh.pool->size();
+  return out;
+}
+
+inline void reset_residency_stats() {
+  auto& sh = SharedResidency::instance();
+  sh.fault_count.store(0, std::memory_order_relaxed);
+  sh.fault_nanos.store(0, std::memory_order_relaxed);
+}
+
 // Per-layer view. Owns nothing but the offload mask; storage comes from SharedResidency.
 class LayerResidency {
  public:

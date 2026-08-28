@@ -467,6 +467,9 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
            py::overload_cast<std::shared_ptr<MoeClass>, intptr_t, int, intptr_t, intptr_t, intptr_t, intptr_t, bool>(
                &MoeBindings::ForwardBindings::cpuinfer_interface))
       .def("warm_up", &MoeClass::warm_up)
+      // Call after load_weights() and before any forward(). A no-op unless the config carries an
+      // ssd_experts_mask.
+      .def("spill_offloaded_experts", &MoeClass::spill_offloaded_experts)
       .def("load_weights", &MoeClass::load_weights)
       .def("forward", &MoeClass::forward_binding);
 
@@ -743,6 +746,21 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
 
   auto moe_module = m.def_submodule("moe");
 
+  // Stage 1 SSD residency counters, aggregated across every layer sharing the backing store.
+  // `enabled` is false until some layer has actually spilled. Returned as a dict so adding a
+  // counter later does not break callers.
+  moe_module.def("residency_stats", []() {
+    const auto st = kt_residency::residency_stats();
+    py::dict out;
+    out["enabled"] = st.enabled;
+    out["faults"] = st.faults;
+    out["nanos"] = st.nanos;
+    out["bytes"] = st.bytes;
+    out["slot_count"] = st.slot_count;
+    return out;
+  });
+  moe_module.def("reset_residency_stats", []() { kt_residency::reset_residency_stats(); });
+
   py::class_<GeneralMOEConfig>(moe_module, "MOEConfig")
       .def(py::init([](int expert_num, int routed_expert_num, int hidden_size, int intermediate_size) {
         return GeneralMOEConfig(expert_num, routed_expert_num, hidden_size, intermediate_size);
@@ -774,6 +792,17 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
           [](const GeneralMOEConfig& self) { return reinterpret_cast<uintptr_t>(self.gpu_experts_mask); },
           [](GeneralMOEConfig& self, uintptr_t val) { self.gpu_experts_mask = reinterpret_cast<uint8_t*>(val); })
       .DEF_PTR_PROPERTY(GeneralMOEConfig, physical_to_logical_map)
+
+      // Stage 1 SSD expert residency. Setting ssd_experts_mask is what turns it on; the other
+      // three are required alongside it. The mask is held by pointer, so the Python object
+      // backing it must outlive the operator -- same contract as gpu_experts_mask.
+      .def_property(
+          "ssd_experts_mask",
+          [](const GeneralMOEConfig& self) { return reinterpret_cast<uintptr_t>(self.ssd_experts_mask); },
+          [](GeneralMOEConfig& self, uintptr_t val) { self.ssd_experts_mask = reinterpret_cast<uint8_t*>(val); })
+      .def_readwrite("ssd_store_path", &GeneralMOEConfig::ssd_store_path)
+      .def_readwrite("ssd_num_layers", &GeneralMOEConfig::ssd_num_layers)
+      .def_readwrite("ssd_slot_count", &GeneralMOEConfig::ssd_slot_count)
 
       .DEF_PTR_PROPERTY(GeneralMOEConfig, gate_proj)
       .DEF_PTR_PROPERTY(GeneralMOEConfig, up_proj)
