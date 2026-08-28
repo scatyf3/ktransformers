@@ -429,6 +429,11 @@ if(KTRANSFORMERS_CPU_DEBUG)
         ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/shared_mem_buffer.cpp
     )
     target_link_libraries(test_shared_mem_buffer_lifetime PRIVATE Threads::Threads numa)
+    # Header-only and libc-only: no llama, no AMX, no NUMA. Runs anywhere the build does.
+    add_executable(
+        test_residency_store
+        ${CMAKE_CURRENT_SOURCE_DIR}/operators/test/test_residency_store.cpp
+    )
 endif()
 
 
@@ -449,6 +454,11 @@ if(HOST_IS_X86)
         # target_link_libraries(amx-test llama)
         if(KTRANSFORMERS_CPU_DEBUG)
             file(GLOB AMX_TEST_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/operators/amx/test/*.cpp")
+            # The residency test builds a real AMX_BF16_MOE_TP, so it needs the worker pool and
+            # therefore hwloc, whose imported target is only defined further down this file. It
+            # gets its own target after that point.
+            list(REMOVE_ITEM AMX_TEST_SOURCES
+                "${CMAKE_CURRENT_SOURCE_DIR}/operators/amx/test/test_residency_official_load.cpp")
             foreach(test_src ${AMX_TEST_SOURCES})
                 # 获取不带扩展名的文件名作为 target 名
                 get_filename_component(test_name ${test_src} NAME_WE)
@@ -677,6 +687,22 @@ if(PKG_CONFIG_FOUND)
 else(PKG_CONFIG_FOUND)
     message(FATAL_ERROR "FindHWLOC needs pkg-config program and PKG_CONFIG_PATH must contain the path to hwloc.pc file.")
 endif(PKG_CONFIG_FOUND)
+
+# Residency bit-exactness against the operator's own packed weights. Unlike the other AMX tests
+# this one constructs a full MoE operator, so it links the worker pool and hwloc on top of the
+# usual set. Defined here because PkgConfig::HWLOC does not exist any earlier.
+if(HOST_IS_X86 AND KTRANSFORMERS_CPU_USE_AMX_AVX512 AND KTRANSFORMERS_CPU_DEBUG)
+    add_executable(
+        test_residency_official_load
+        ${CMAKE_CURRENT_SOURCE_DIR}/operators/amx/test/test_residency_official_load.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/shared_mem_buffer.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/worker_pool.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/cpu_backend/task_queue.cpp
+    )
+    target_compile_options(test_residency_official_load PRIVATE ${ARCH_FLAGS})
+    target_link_libraries(test_residency_official_load
+        PRIVATE llama OpenMP::OpenMP_CXX numa Threads::Threads PkgConfig::HWLOC)
+endif()
 
 
 add_library(llamafile STATIC ${SOURCE_DIR4})
